@@ -51,6 +51,27 @@
    直到一整轮没有任何可删集合——即满足 1-最小性；
 3. 产出最终库后再跑一次脚本，确认错误码与完整错误文本与基线一致。
 
+## 修补核查（缩减成功后）
+
+入仓开发者可能已在**缩减库**上试过一段修补 SQL，但还需要确认它对**原库**同样
+有效，才能决定是否采用。页面“修补核查”接受一段**只修改原有表数据或控制事务**
+的补丁脚本（`INSERT/UPDATE/DELETE`、`SELECT`、`BEGIN/COMMIT/SAVEPOINT`；
+禁止 `CREATE/DROP/ALTER/VACUUM/REINDEX/ANALYZE` 等结构变更，静态检查与
+运行期 authorizer 双重拦截），并分别在**原库副本**与**缩减库副本**上独立执行：
+
+1. 在各自的全新副本上运行补丁——必须每条语句都成功，且结束时没有未提交事务。
+   补丁先 `COMMIT`、后报错仍判失败；
+2. 关闭连接后重新打开该副本，用 `PRAGMA foreign_key_check`（及
+   `integrity_check`）校验**实际已提交数据**的外键有效性；
+3. 再从该副本复制一份全新临时文件，用已提交的数据重新运行**原始故障脚本**；
+   脚本不再报错（即补丁确实避免了原错误）才算通过。验证脚本即使先写入再报错，
+   也只影响这份临时副本。
+
+两库结论完全独立：任一步骤失败只记录在该库结论中（补丁错误 / 外键问题 /
+验证所得的 SQLite 错误），不会中断另一库的核查，也不会打开原件或缩减下载库
+的写句柄。**只有两库都通过时页面才显示“可用”**，否则显示“不可用”并逐库列出
+问题；每个库都会分别给出补丁、外键与验证三部分结论。
+
 ## 快速开始（Docker Compose）
 
 ```bash
@@ -59,7 +80,8 @@ docker compose up --build
 ```
 
 页面支持：上传库与脚本（文件或粘贴文本）、运行、轮询查看删减结果与日志、
-下载复现库 `repro.db`，并内置两个可一键试跑的样例。
+下载复现库 `repro.db`，缩减成功后可提交补丁脚本做“修补核查”，并内置两个
+可一键试跑的样例。
 
 停止与清理：
 
@@ -74,7 +96,7 @@ docker compose down -v       # 同时删除任务数据卷
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 DATA_DIR=./data .venv/bin/uvicorn app.main:app --reload --port 8000
-.venv/bin/pytest             # 48 个测试
+.venv/bin/pytest             # 70 个测试
 ```
 
 ## 内置样例
@@ -107,6 +129,8 @@ DATA_DIR=./data .venv/bin/uvicorn app.main:app --reload --port 8000
 | POST | `/api/jobs` | 表单字段 `db`（必填）、`sql`（文件）或 `script_text`（文本），返回 202 与任务 id |
 | GET | `/api/jobs/{id}` | 查询任务状态、错误指纹、行数变化、保留行与缩减日志 |
 | GET | `/api/jobs/{id}/download` | 下载复现库 `repro.db`（仅缩减成功时可用） |
+| POST | `/api/jobs/{id}/patch-checks` | 表单字段 `sql`（文件）或 `script_text`（文本），提交补丁核查，返回 202 与核查 id（仅缩减成功时可用） |
+| GET | `/api/jobs/{id}/patch-checks/{check_id}` | 查询核查状态与逐库结论（`available`、`verdict`、`original`/`reduced`、`problems`） |
 
 ## 目录结构
 
@@ -120,10 +144,11 @@ app/
   reducer.py       # ddmin + 逐行闭包终检
   jobs.py          # 后台任务与并发/TTL 管理
   service.py       # 上传->校验->确认->缩减 流水线
+  patch_check.py   # 补丁核查：原库/缩减库副本、提交后外键、重跑原脚本
   samples.py       # 内置样例生成
   main.py          # FastAPI 路由
   static/index.html
-tests/             # 48 个单元/集成/端到端测试
+tests/             # 70 个单元/集成/端到端测试
 Dockerfile
 docker-compose.yml
 ```

@@ -1,9 +1,9 @@
-"""上传 -> 校验 -> 确认错误 -> 缩减 的完整流水线。"""
+"""上传 -> 校验 -> 确认错误 -> 缩减 的完整流水线，以及补丁核查后台任务。"""
 from __future__ import annotations
 
 from pathlib import Path
 
-from .jobs import Job
+from .jobs import Job, PatchCheck
 from .reducer import reduce_database
 from .runner import confirm_baseline, make_canonical_copy
 from .script_guard import parse_script
@@ -20,6 +20,8 @@ def run_pipeline(job: Job, uploaded_db: str, raw_script: bytes) -> None:
     job_dir = Path(job.dir)
     canonical = job_dir / "canonical.db"
     make_canonical_copy(uploaded_db, str(canonical))
+    # 核查补丁时需要在两个库上重新运行原始故障脚本，落盘保存其规范化文本
+    (job_dir / "original_script.sql").write_text(script, encoding="utf-8")
 
     job.message = "正在独立副本上确认原始错误并校验确定性…"
     baseline = confirm_baseline(str(canonical), script, str(job_dir))

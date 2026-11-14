@@ -43,6 +43,20 @@
         padding: 10px; overflow: auto; font-size: 12px; max-height: 320px; }
   .err { color: var(--red); font-weight: 600; white-space: pre-wrap; }
   .ok-msg { color: var(--green); font-weight: 600; }
+  .patch-box { border-top: 1px dashed var(--border); margin-top: 18px; padding-top: 14px; }
+  .verdict { display: none; margin-top: 14px; }
+  .verdict.active { display: block; }
+  .verdict .banner { padding: 10px 14px; border-radius: 6px; font-weight: 600; }
+  .verdict .banner.ok { background: #dafbe1; color: var(--green); }
+  .verdict .banner.bad { background: #ffebe9; color: var(--red); }
+  .db-result { border: 1px solid var(--border); border-radius: 6px;
+               padding: 10px 14px; margin-top: 10px; }
+  .db-result h4 { margin: 0 0 6px; font-size: 14px; }
+  .db-result.ok { border-color: #2da44e; }
+  .db-result.bad { border-color: #cf222e; }
+  .db-result ul { margin: 6px 0 0; padding-left: 20px; }
+  .db-result li { color: var(--red); }
+  .db-result code { font-size: 12px; }
   a.dl { display: inline-block; margin-top: 12px; background: var(--green);
          color: #fff; text-decoration: none; padding: 9px 22px; border-radius: 6px; }
   .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
@@ -92,11 +106,29 @@
     <p id="job-message"></p>
     <div id="job-detail"></div>
   </section>
+
+  <section class="card patch-box status" id="patch-panel">
+    <h2>修补核查</h2>
+    <p class="hint">提交只修改原有表数据或控制事务的补丁脚本（不得 CREATE/DROP/ALTER）。
+      补丁会分别在<b>原库副本</b>与<b>缩减库副本</b>上运行；两库都满足
+      “补丁完整成功、提交后外键有效、重新运行原故障脚本不再报错”才显示“可用”。</p>
+    <form id="patch-form">
+      <label for="patch_sql">补丁 SQL 脚本文件（可选，与下方文本框二选一）</label>
+      <input id="patch_sql" name="patch_sql" type="file" accept=".sql,text/plain">
+      <label for="patch_text">或直接粘贴补丁脚本</label>
+      <textarea id="patch_text" name="patch_text"
+        placeholder="UPDATE dept SET name = 'Platform-fixed' WHERE id = 1;"></textarea>
+      <div><button id="patch-btn" type="submit">运行修补核查</button></div>
+    </form>
+    <div class="verdict" id="patch-result"></div>
+  </section>
 </main>
 
 <script>
 const $ = (id) => document.getElementById(id);
 let pollTimer = null;
+let patchPollTimer = null;
+let currentJobId = null;
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => (
@@ -148,11 +180,16 @@ async function submitForm(form) {
   showPanel();
   setStatus('running', '已上传，等待处理…');
   $('job-detail').innerHTML = '';
+  // 新任务尚未成功缩减，先隐藏上一次任务的修补核查入口
+  $('patch-panel').classList.remove('active');
+  $('patch-result').classList.remove('active');
+  $('patch-btn').disabled = false;
   try {
     const r = await fetch('/api/jobs', { method: 'POST', body: form });
     const data = await r.json();
     if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
     $('job-id').textContent = data.id.slice(0, 8);
+    currentJobId = data.id;
     pollJob(data.id);
   } catch (err) {
     setStatus('error', '');
@@ -239,6 +276,123 @@ function finish(id, job) {
     html += `<a class="dl" href="/api/jobs/${id}/download">下载复现库 repro.db</a>`;
   }
   $('job-detail').innerHTML = html;
+
+  // 只有缩减成功的任务才提供修补核查入口
+  const patchPanel = $('patch-panel');
+  if (job.kind === 'reduced' && job.download_available) {
+    patchPanel.classList.add('active');
+  } else {
+    patchPanel.classList.remove('active');
+    $('patch-result').classList.remove('active');
+  }
+}
+
+function patchErrorBlock(title, e) {
+  if (!e) return '';
+  if (e.ok) return `<span class="ok-msg">${title}：完整成功</span>`;
+  if (e.timed_out) return `<span class="err">${title}：超时（${esc(e.error_message || '')}）</span>`;
+  const name = e.error_name || '未知错误';
+  const code = e.error_code == null ? '' : `（${e.error_code}）`;
+  const msg = e.error_message || '';
+  return `<span class="err">${title}：<code>${esc(name)}${code}</code>
+    ${msg ? `<br>${esc(msg)}` : ''}</span>`;
+}
+
+function dbResultBlock(r) {
+  const cls = r.ok ? 'ok' : 'bad';
+  const badge = r.ok ? '<span class="ok-msg">通过</span>' :
+                      '<span class="err">未通过</span>';
+  let html = `<div class="db-result ${cls}"><h4>${esc(r.label)} ${badge}</h4>`;
+  if (r.patch) {
+    html += `<div style="margin:4px 0">${patchErrorBlock('补丁执行', r.patch)}</div>`;
+  }
+  if (r.foreign_keys) {
+    html += r.foreign_keys.ok
+      ? '<div style="margin:4px 0" class="ok-msg">提交后外键有效性：通过</div>'
+      : `<div style="margin:4px 0" class="err">提交后外键有效性：未通过</div>`;
+  }
+  if (r.verification) {
+    html += r.verification.ok
+      ? '<div style="margin:4px 0" class="ok-msg">重新运行原故障脚本：不再报错</div>'
+      : `<div style="margin:4px 0">${patchErrorBlock('重新运行原故障脚本',
+          r.verification)}</div>`;
+  }
+  if (r.problems && r.problems.length) {
+    html += '<ul>';
+    for (const p of r.problems) html += `<li>${esc(p)}</li>`;
+    html += '</ul>';
+  }
+  return html + '</div>';
+}
+
+function finishPatchCheck(check) {
+  $('patch-btn').disabled = false;
+  const box = $('patch-result');
+  if (check.status === 'error') {
+    box.classList.add('active');
+    box.innerHTML = `<div class="banner bad">核查失败：${esc(check.message)}</div>`;
+    return;
+  }
+  const avail = !!check.available;
+  box.classList.add('active');
+  box.innerHTML =
+    `<div class="banner ${avail ? 'ok' : 'bad'}">` +
+    `${avail ? '可用' : '不可用'}：${esc(check.message || '')}</div>` +
+    dbResultBlock(check.original) + dbResultBlock(check.reduced);
+}
+
+$('patch-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const file = $('patch_sql').files[0];
+  const text = $('patch_text').value;
+  if (!file && !text.trim()) { alert('请上传或粘贴补丁 SQL 脚本'); return; }
+  if (!currentJobId) { alert('请先完成一次缩减任务'); return; }
+  const form = new FormData();
+  if (file) form.append('sql', file);
+  form.append('script_text', text);
+  submitPatch(`/api/jobs/${currentJobId}/patch-checks`, form);
+});
+
+async function submitPatch(url, form) {
+  $('patch-btn').disabled = true;
+  $('patch-result').classList.remove('active');
+  try {
+    const r = await fetch(url, { method: 'POST', body: form });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    pollPatch(url, data.id);
+  } catch (err) {
+    $('patch-btn').disabled = false;
+    const box = $('patch-result');
+    box.classList.add('active');
+    box.innerHTML = `<div class="banner bad">${esc(err.message)}</div>`;
+  }
+}
+
+function pollPatch(url, checkId) {
+  clearInterval(patchPollTimer);
+  $('patch-result').classList.add('active');
+  $('patch-result').innerHTML =
+    '<div class="hint">核查进行中：正在原库与缩减库的独立副本上运行补丁…</div>';
+  patchPollTimer = setInterval(async () => {
+    try {
+      const r = await fetch(`${url}/${checkId}`);
+      const check = await r.json();
+      if (!r.ok) throw new Error(check.detail || `HTTP ${r.status}`);
+      if (check.status === 'running' || check.status === 'queued') {
+        $('patch-result').innerHTML =
+          `<div class="hint">核查进行中：${esc(check.message || '')}</div>`;
+        return;
+      }
+      clearInterval(patchPollTimer);
+      finishPatchCheck(check);
+    } catch (err) {
+      clearInterval(patchPollTimer);
+      $('patch-btn').disabled = false;
+      $('patch-result').innerHTML =
+        `<div class="banner bad">${esc(err.message)}</div>`;
+    }
+  }, 1000);
 }
 
 loadSamples();

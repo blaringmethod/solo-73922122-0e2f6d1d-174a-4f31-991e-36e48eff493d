@@ -169,3 +169,109 @@ def test_missing_script_rejected(client):
         data={"script_text": ""},
     )
     assert r.status_code == 400
+
+
+def _wait_check(client, job_id, check_id, timeout=60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = client.get(f"/api/jobs/{job_id}/patch-checks/{check_id}")
+        assert r.status_code == 200, r.text
+        check = r.json()
+        if check["status"] in ("done", "error"):
+            return check
+        time.sleep(0.2)
+    raise AssertionError("补丁核查超时未结束")
+
+
+def _reduced_job(client):
+    db = client.get("/static/sample_cyclic.db").content
+    r = client.post(
+        "/api/jobs",
+        files={"db": ("cyclic.db", db, "application/x-sqlite3")},
+        data={"script_text": "INSERT INTO dept (id, name) VALUES (1, 'Platform');"},
+    )
+    job = _wait_done(client, r.json()["id"])
+    assert job["kind"] == "reduced" and job["download_available"] is True
+    return job
+
+
+def test_patch_check_api_available_and_download_intact(client):
+    job = _reduced_job(client)
+    r = client.post(
+        f"/api/jobs/{job['id']}/patch-checks",
+        data={"script_text": (
+            "BEGIN;\nDELETE FROM project;\nDELETE FROM employee;\n"
+            "DELETE FROM dept;\nCOMMIT;\n"
+        )},
+    )
+    assert r.status_code == 202, r.text
+    check = _wait_check(client, job["id"], r.json()["id"])
+    assert check["status"] == "done"
+    assert check["available"] is True and check["verdict"] == "可用"
+    assert check["original"]["ok"] and check["reduced"]["ok"]
+    assert check["original"]["foreign_keys"]["ok"] is True
+    assert check["original"]["verification"]["ok"] is True
+    # 核查不影响原缩减库下载
+    dl = client.get(f"/api/jobs/{job['id']}/download")
+    assert dl.status_code == 200
+    assert dl.content.startswith(b"SQLite format 3\x00")
+
+
+def test_patch_check_api_unavailable_reports_each_database(client):
+    job = _reduced_job(client)
+    r = client.post(
+        f"/api/jobs/{job['id']}/patch-checks",
+        data={"script_text": "UPDATE dept SET name = 'Platform-ish' WHERE id = 1;"},
+    )
+    assert r.status_code == 202
+    check = _wait_check(client, job["id"], r.json()["id"])
+    assert check["available"] is False and check["verdict"] == "不可用"
+    # 两库补丁都成功、外键有效，但重新运行原故障脚本仍报同一个错误
+    for kind in ("original", "reduced"):
+        block = check[kind]
+        assert block["patch"]["ok"] is True
+        assert block["foreign_keys"]["ok"] is True
+        assert block["problems"]
+        assert "验证错误" in block["problems"][0]
+        assert block["verification"]["error_name"] == (
+            "SQLITE_CONSTRAINT_PRIMARYKEY"
+        )
+    assert any(p.startswith("原库：") for p in check["problems"])
+    assert any(p.startswith("缩减库：") for p in check["problems"])
+
+
+def test_patch_check_rejects_schema_patch(client):
+    job = _reduced_job(client)
+    r = client.post(
+        f"/api/jobs/{job['id']}/patch-checks",
+        data={"script_text": "CREATE TABLE x (id INTEGER PRIMARY KEY);"},
+    )
+    assert r.status_code == 400
+    assert "CREATE" in r.json()["detail"]
+
+
+def test_patch_check_requires_reduced_job(client):
+    db = client.get("/static/sample_cyclic.db").content
+    r = client.post(
+        "/api/jobs",
+        files={"db": ("cyclic.db", db, "application/x-sqlite3")},
+        data={"script_text": "SELECT 1;"},
+    )
+    job = _wait_done(client, r.json()["id"])
+    r = client.post(
+        f"/api/jobs/{job['id']}/patch-checks",
+        data={"script_text": "DELETE FROM dept;"},
+    )
+    assert r.status_code == 400
+
+
+def test_patch_check_missing_check_400(client):
+    job = _reduced_job(client)
+    r = client.get(f"/api/jobs/{job['id']}/patch-checks/nope")
+    assert r.status_code == 400
+
+
+def test_patch_check_requires_script(client):
+    job = _reduced_job(client)
+    r = client.post(f"/api/jobs/{job['id']}/patch-checks", data={"script_text": " "})
+    assert r.status_code == 400

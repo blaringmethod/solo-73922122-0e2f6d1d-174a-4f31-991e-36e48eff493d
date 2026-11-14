@@ -12,7 +12,9 @@ from fastapi.staticfiles import StaticFiles
 from . import config
 from .errors import JobError, ScriptRejected, ValidationError
 from .jobs import registry
+from .patch_check import can_patch_check, run_patch_check
 from .samples import ensure_samples
+from .script_guard import parse_patch_script
 from .service import run_pipeline
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -103,6 +105,37 @@ def download_reduced(job_id: str) -> FileResponse:
         media_type="application/x-sqlite3",
         filename="repro.db",
     )
+
+
+@app.post("/api/jobs/{job_id}/patch-checks")
+async def create_patch_check(
+    job_id: str,
+    sql: UploadFile | None = File(None, description="补丁 SQL 脚本文件"),
+    script_text: str = Form("", description="或直接粘贴补丁 SQL 脚本"),
+) -> JSONResponse:
+    job = registry.get(job_id)
+    if not can_patch_check(job):
+        raise JobError("只有缩减成功的任务才能做补丁核查。")
+    raw_patch = await sql.read() if sql is not None else script_text.encode("utf-8")
+    if not raw_patch.strip():
+        raise ValidationError("请上传或粘贴补丁 SQL 脚本。")
+    if len(raw_patch) > config.MAX_SCRIPT_BYTES:
+        raise ValidationError(
+            f"补丁脚本大小 {len(raw_patch)} 字节，"
+            f"超过上限 {config.MAX_SCRIPT_BYTES} 字节。"
+        )
+    # 结构性补丁在入队前直接拒绝，避免无意义的后台核查。
+    parse_patch_script(raw_patch)
+
+    job, check = registry.create_patch_check(job_id)
+    registry.run_check_in_background(job, check, run_patch_check, raw_patch)
+    return JSONResponse({"id": check.id, "status": check.status}, status_code=202)
+
+
+@app.get("/api/jobs/{job_id}/patch-checks/{check_id}")
+def get_patch_check(job_id: str, check_id: str) -> JSONResponse:
+    check = registry.get_patch_check(job_id, check_id)
+    return JSONResponse(check.public_dict())
 
 
 @app.exception_handler(ValidationError)

@@ -160,6 +160,166 @@ def confirm_baseline(canonical_path: str, script: str, work_dir: str) -> ScriptR
     return first
 
 
+@dataclass(frozen=True)
+class PatchResult:
+    """补丁脚本在单个独立副本上的执行结果。
+
+    * ``ok`` 仅当脚本每条语句都成功；
+    * ``committed`` 表示脚本结束时连接上没有未提交事务；
+    * 即使脚本先提交、后报错，``ok`` 仍为 False（按失败处理）。
+    """
+
+    ok: bool
+    committed: bool = False
+    write_attempted: bool = False
+    timed_out: bool = False
+    error_code: int | None = None
+    error_name: str | None = None
+    error_message: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "ok": self.ok,
+            "committed": self.committed,
+            "write_attempted": self.write_attempted,
+            "timed_out": self.timed_out,
+            "error_code": self.error_code,
+            "error_name": self.error_name,
+            "error_message": self.error_message,
+        }
+
+
+# 补丁允许的动作：仅数据读写、查询与事务控制。结构变更一律拒绝。
+_PATCH_DATA_ACTIONS = frozenset(
+    {
+        sqlite3.SQLITE_SELECT,
+        sqlite3.SQLITE_READ,
+        sqlite3.SQLITE_INSERT,
+        sqlite3.SQLITE_UPDATE,
+        sqlite3.SQLITE_DELETE,
+        sqlite3.SQLITE_TRANSACTION,
+        sqlite3.SQLITE_SAVEPOINT,
+        sqlite3.SQLITE_RECURSIVE,
+    }
+)
+_PATCH_WRITE_ACTIONS = frozenset(
+    {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}
+)
+
+
+def _make_patch_authorizer() -> tuple[object, list[bool]]:
+    """补丁专用 authorizer，是静态检查之外的运行期最终防线。
+
+    允许改数据、控制事务与使用普通 SQL 函数；拒绝 CREATE/DROP/ALTER/ATTACH
+    等一切结构或外部操作。PRAGMA 仅允许 foreign_keys（补丁可以借此临时关闭
+    外键，但提交后的外键有效性由核查统一校验）。
+    """
+    write_seen = [False]
+
+    def _authorizer(action: int, arg1: str | None, arg2: str | None,
+                    db_name: str | None, trigger: str | None) -> int:
+        if action in _PATCH_WRITE_ACTIONS:
+            if str(arg1).lower().startswith("sqlite_"):
+                return sqlite3.SQLITE_DENY
+            write_seen[0] = True
+            return sqlite3.SQLITE_OK
+        if action in _PATCH_DATA_ACTIONS:
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_FUNCTION:
+            if str(arg1).lower() in (
+                "load_extension",
+                "readfile",
+                "writefile",
+            ):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_PRAGMA:
+            if str(arg1).lower() == "foreign_keys" and db_name is None:
+                return sqlite3.SQLITE_OK
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_DENY
+
+    return _authorizer, write_seen
+
+
+def run_patch_on_copy(source_path: str, dest_path: str, script: str,
+                      work_dir: str) -> PatchResult:
+    """把 source 复制到 dest，在 dest 上执行补丁脚本并保留已提交的数据。
+
+    与试跑一样在独立副本上进行；脚本结束（或报错）后连接一定关闭。
+    dest 上的最终数据即“实际已提交的数据”，供调用方做外键检查与验证。
+    """
+    shutil.copyfile(source_path, dest_path)
+    _remove_sidecars(dest_path)
+
+    result_box: dict[str, PatchResult] = {}
+    error_box: dict[str, BaseException] = {}
+    authorizer, write_seen = _make_patch_authorizer()
+
+    def _worker() -> None:
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(dest_path, timeout=5.0)
+            conn.set_authorizer(authorizer)
+            conn.execute("PRAGMA foreign_keys=ON")
+            try:
+                conn.executescript(script)
+            except sqlite3.Error as exc:
+                result_box["result"] = PatchResult(
+                    ok=False,
+                    committed=not conn.in_transaction,
+                    write_attempted=write_seen[0],
+                    error_code=exc.sqlite_errorcode,
+                    error_name=exc.sqlite_errorname,
+                    error_message=str(exc),
+                )
+            else:
+                result_box["result"] = PatchResult(
+                    ok=True,
+                    committed=not conn.in_transaction,
+                    write_attempted=write_seen[0],
+                )
+        except BaseException as exc:  # noqa: BLE001 - 回传线程内任何异常
+            error_box["error"] = exc
+        finally:
+            if conn is not None:
+                conn.close()
+
+    thread = threading.Thread(target=_worker, name="sqlite-patch", daemon=True)
+    thread.start()
+    thread.join(config.TRIAL_TIMEOUT_SECONDS)
+
+    if thread.is_alive():
+        # 补丁可能仍在写 dest；调用方据此判失败，不再读取该文件。
+        return PatchResult(
+            ok=False,
+            timed_out=True,
+            error_message=(
+                f"补丁执行超过 {config.TRIAL_TIMEOUT_SECONDS} 秒，已放弃。"
+            ),
+        )
+    if "error" in error_box:
+        raise error_box["error"]
+    return result_box["result"]
+
+
+def read_effective_foreign_key_violations(db_path: str) -> list[dict[str, object]]:
+    """关闭连接后重新打开数据库，检查已提交数据的外键有效性与完整性。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        violations = [
+            dict(row)
+            for row in conn.execute("PRAGMA foreign_key_check").fetchall()
+        ]
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    finally:
+        conn.close()
+    if integrity != "ok":
+        violations.append({"integrity": integrity})
+    return violations
+
+
 def delete_rows(canonical_path: str, work_dir: str, kept_rows: set[tuple[str, int]],
                 schema_tables: list[str], pk_column: dict[str, str],
                 out_path: str) -> None:
